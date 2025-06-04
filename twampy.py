@@ -431,6 +431,122 @@ class twampySessionReflector(udpSession):
         log.info("TWL session reflector stopped")
 
 
+class stampSessionSender(twampySessionSender):
+    """Session sender for STAMP."""
+
+    def run(self):
+        schedule = now()
+        endtime = schedule + self.count * self.interval + 5
+
+        idx = 0
+        while self.running:
+            while select.select([self.socket], [], [], 0)[0]:
+                t4 = now()
+                data, address = self.recvfrom()
+
+                if len(data) < 40:
+                    log.error("short packet received: %d bytes", len(data))
+                    continue
+
+                t3 = time_ntp2py(data[4:12])
+                t2 = time_ntp2py(data[16:24])
+                t1 = time_ntp2py(data[28:36])
+
+                delayRT = max(0, 1000 * (t4 - t1 + t2 - t3))
+                delayOB = max(0, 1000 * (t2 - t1))
+                delayIB = max(0, 1000 * (t4 - t3))
+
+                rseq = struct.unpack('!I', data[0:4])[0]
+                sseq = struct.unpack('!I', data[24:28])[0]
+
+                log.info(
+                    "Reply from %s [rseq=%d sseq=%d rtt=%.2fms outbound=%.2fms inbound=%.2fms]",
+                    address[0], rseq, sseq, delayRT, delayOB, delayIB,
+                )
+                self.stats.add(delayRT, delayOB, delayIB, rseq, sseq)
+
+                if sseq + 1 == self.count:
+                    log.info("All packets received back")
+                    self.running = False
+
+            t1 = now()
+            if (t1 >= schedule) and (idx < self.count):
+                schedule = schedule + self.interval
+
+                data = struct.pack(
+                    '!L2IHH',
+                    idx,
+                    int(TIMEOFFSET + t1),
+                    int((t1 - int(t1)) * ALLBITS),
+                    0x3fff,
+                    0,
+                )
+                pbytes = zeros(self.padmix[int(len(self.padmix) * random.random())])
+
+                self.sendto(data + pbytes, (self.remote_addr, self.remote_port))
+                log.info("Sent to %s [sseq=%d]", self.remote_addr, idx)
+
+                idx = idx + 1
+                if schedule > t1:
+                    select.select([self.socket], [], [], schedule - t1)
+
+            if t1 > endtime:
+                log.info("Receive timeout for last packet (don't wait anymore)")
+                self.running = False
+
+        self.stats.dump(idx)
+
+
+class stampSessionReflector(twampySessionReflector):
+    """Session reflector for STAMP."""
+
+    def run(self):
+        index = {}
+        reset = {}
+
+        while self.running:
+            try:
+                data, address = self.recvfrom()
+
+                t2 = now()
+                sec = int(TIMEOFFSET + t2)
+                msec = int((t2 - int(t2)) * ALLBITS)
+
+                sseq = struct.unpack('!I', data[0:4])[0]
+                t1 = time_ntp2py(data[4:12])
+
+                log.info(
+                    "Request from %s:%d [sseq=%d outbound=%.2fms]",
+                    address[0],
+                    address[1],
+                    sseq,
+                    1000 * (t2 - t1),
+                )
+
+                idx = 0
+                if address not in index.keys():
+                    log.info("set rseq:=0     (new remote address/port)")
+                elif reset[address] < t2:
+                    log.info("reset rseq:=0   (session timeout, 30sec)")
+                elif sseq == 0:
+                    log.info("reset rseq:=0   (received sseq==0)")
+                else:
+                    idx = index[address]
+
+                rdata = struct.pack('!L2I2H2I', idx, sec, msec, 0x001, 0, sec, msec)
+                pbytes = zeros(self.padmix[int(len(self.padmix) * random.random())])
+                self.sendto(rdata + data[0:16] + pbytes, address)
+
+                index[address] = idx + 1
+                reset[address] = t2 + 30
+
+            except Exception as e:
+                log.debug('Exception: %s', str(e))
+                break
+
+        log.info("STAMP session reflector stopped")
+
+
 class twampyControlClient:
 
     def __init__(self, server="", tcp_port=862, tos=0x88, ipversion=4):
@@ -548,6 +664,30 @@ def twl_sender(args):
     sender = twampySessionSender(args)
     sender.daemon = True
     sender.name = "twl_responder"
+    sender.start()
+
+    signal.signal(signal.SIGINT, sender.stop)
+
+    while sender.is_alive():
+        time.sleep(0.1)
+
+
+def stamp_responder(args):
+    reflector = stampSessionReflector(args)
+    reflector.daemon = True
+    reflector.name = "stamp_responder"
+    reflector.start()
+
+    signal.signal(signal.SIGINT, reflector.stop)
+
+    while reflector.is_alive():
+        time.sleep(0.1)
+
+
+def stamp_sender(args):
+    sender = stampSessionSender(args)
+    sender.daemon = True
+    sender.name = "stamp_responder"
     sender.start()
 
     signal.signal(signal.SIGINT, sender.stop)
@@ -721,6 +861,18 @@ if __name__ == '__main__':
     group.add_argument('-i', '--interval', metavar='msec', default=100,  type=int, help="[100,1000]")
     group.add_argument('-c', '--count',    metavar='packets', default=100,  type=int, help="[1..9999]")
 
+    p_stamp_responder = subparsers.add_parser('stamp-responder', help='STAMP responder', parents=[debug_parser, ipopt_parser])
+    group = p_stamp_responder.add_argument_group("STAMP responder options")
+    group.add_argument('near_end', nargs='?', metavar='local-ip:port', default=':20001')
+    group.add_argument('--timer', metavar='value',   default=0,     type=int, help='STAMP session reset')
+
+    p_stamp_sender = subparsers.add_parser('stamp-sender', help='STAMP sender', parents=[debug_parser, ipopt_parser])
+    group = p_stamp_sender.add_argument_group("STAMP sender options")
+    group.add_argument('far_end', nargs='?', metavar='remote-ip:port', default='127.0.0.1:20001')
+    group.add_argument('near_end', nargs='?', metavar='local-ip:port', default=':20000')
+    group.add_argument('-i', '--interval', metavar='msec', default=100,  type=int, help="[100,1000]")
+    group.add_argument('-c', '--count',    metavar='packets', default=100,  type=int, help="[1..9999]")
+
     p_control = subparsers.add_parser('controller', help='TWAMP controller', parents=[debug_parser, ipopt_parser])
     group = p_control.add_argument_group("TWAMP controller options")
     group.add_argument('far_end', nargs='?', metavar='remote-ip:port', default="127.0.0.1:20001")
@@ -741,6 +893,8 @@ if __name__ == '__main__':
     p_control.set_defaults(parseop=True, func=twamp_controller)
     p_ctclient.set_defaults(parseop=True, func=twamp_ctclient)
     p_responder.set_defaults(parseop=True, func=twl_responder)
+    p_stamp_sender.set_defaults(parseop=True, func=stamp_sender)
+    p_stamp_responder.set_defaults(parseop=True, func=stamp_responder)
     p_dscptab.set_defaults(parseop=False, func=dscpTable)
 
 #############################################################################
